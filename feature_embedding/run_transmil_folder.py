@@ -1,0 +1,270 @@
+# save as run_transmil_folder.py
+#
+# TransMIL modelini kullanarak bir klasördeki tüm .h5 patch feature dosyalarından
+# slide-level embedding çıkarır ve .npy olarak kaydeder.
+#
+# Kullanım:
+#   python run_transmil_folder.py \
+#     --h5_dir "D:/TRIDENT_OUTPUT/uni_v2/h5_files" \
+#     --ckpt_path "D:/checkpoints/s_9_checkpoint.pt" \
+#     --output_dir "D:/WSI_SLIDE_EMBEDDINGS" \
+#     --in_dim 1536 \   # patch encoder çıktı boyutu (uni_v2 -> 1536, uni_v1 -> 1024)
+#     --n_classes 2 \
+#     --embed_dim 512
+
+import math, h5py, numpy as np, torch, torch.nn as nn, torch.nn.functional as F
+from pathlib import Path
+import argparse
+
+
+# --- MODEL MIMARISI -----------------------------------------------------------
+
+class NystromAttention(nn.Module):
+    """
+    Nystrom yontemiyle yaklasik self-attention.
+    Standart attention O(N^2) bellek kullanirken bu O(N*m) kullanir;
+    buyuk WSI'larda (binlerce patch) bellek acisindan kritik.
+    m = num_landmarks: ne kadar kucukse o kadar hizli ama o kadar yaklasik.
+    """
+    def __init__(self, dim, num_heads=8, num_landmarks=256, dropout=0.0):
+        super().__init__()
+        self.num_heads = num_heads; self.head_dim = dim // num_heads
+        self.num_landmarks = num_landmarks; self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim*3, bias=False); self.proj = nn.Linear(dim, dim)
+        self.attn_drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, N, C = x.shape; H, D = self.num_heads, self.head_dim
+        qkv = self.qkv(x).reshape(B,N,3,H,D).permute(2,0,3,1,4)
+        q, k, v = qkv.unbind(0)
+        m = self.num_landmarks
+
+        # Landmark noktalarini patch'lerin ortalamasiyla olustur
+        if N >= m:
+            seg = N // m
+            q_land = q[:,:,:m*seg].reshape(B,H,m,seg,D).mean(3)
+            k_land = k[:,:,:m*seg].reshape(B,H,m,seg,D).mean(3)
+        else:
+            # Patch sayisi landmark sayisindan azsa direkt kullan
+            q_land, k_land = q, k
+
+        # Uc attention matrisi: Q-Kl, Ql-Kl, Ql-K
+        k1 = F.softmax(torch.matmul(q, k_land.transpose(-2,-1))*self.scale, dim=-1)
+        k2 = F.softmax(torch.matmul(q_land, k_land.transpose(-2,-1))*self.scale, dim=-1)
+        k3 = F.softmax(torch.matmul(q_land, k.transpose(-2,-1))*self.scale, dim=-1)
+
+        # Moore-Penrose pseudo-inverse (iteratif yaklasim, 6 iterasyon yeterli)
+        I = torch.eye(k2.size(-1), device=k2.device, dtype=k2.dtype)
+        V = (1.0/(torch.max(torch.sum(torch.abs(k2),dim=-2),dim=-1,keepdim=True)[0]
+                  *torch.max(torch.sum(torch.abs(k2),dim=-1),dim=-1,keepdim=True)[0]
+                 ).unsqueeze(-1))*k2.transpose(-1,-2)
+
+        for _ in range(6):
+            KV = torch.matmul(k2, V)
+            V = torch.matmul(0.25*V, 13*I - torch.matmul(KV, 15*I - torch.matmul(KV, 7*I-KV)))
+
+        out = torch.matmul(self.attn_drop(k1), torch.matmul(V, torch.matmul(k3, v)))
+        return self.proj(out.transpose(1,2).reshape(B,N,C))
+
+
+class TransLayer(nn.Module):
+    """Standart transformer blogu: LayerNorm -> Attention -> FF"""
+    def __init__(self, dim=512):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim); self.attn = NystromAttention(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ff = nn.Sequential(nn.Linear(dim,dim*4), nn.GELU(), nn.Linear(dim*4,dim))
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x)); x = x + self.ff(self.norm2(x)); return x
+
+
+class PPEG(nn.Module):
+    """
+    Positional Patch Encoding with Grouping.
+    Patch'leri 2D grid'e yerlestirerek konumsal bilgi ekler.
+    Farkli kernel boyutlarindaki depthwise conv'lar multi-scale komsusluk yakalar.
+    """
+    def __init__(self, dim=512):
+        super().__init__()
+        self.proj  = nn.Conv2d(dim,dim,7,1,3,groups=dim)
+        self.proj1 = nn.Conv2d(dim,dim,5,1,2,groups=dim)
+        self.proj2 = nn.Conv2d(dim,dim,3,1,1,groups=dim)
+
+    def forward(self, x, H, W):
+        B,N,C = x.shape; cls, feat = x[:,0:1], x[:,1:]
+        cnn = feat.transpose(1,2).reshape(B,C,H,W)
+        out = self.proj(cnn)+self.proj1(cnn)+self.proj2(cnn)
+        return torch.cat([cls, out.flatten(2).transpose(1,2)], dim=1)
+
+
+class TransMIL(nn.Module):
+    """
+    TransMIL: Transformer tabanli Multiple Instance Learning modeli.
+    Referans: Shao et al., NeurIPS 2021.
+
+    Akis:
+      patch features (N x in_dim)
+      -> linear projection (N x embed_dim)
+      -> [CLS] token eklenir
+      -> TransLayer (Nystrom attention)
+      -> PPEG (pozisyonel encoding)
+      -> TransLayer
+      -> CLS token cikarilir -> slide embedding (1 x embed_dim)
+      -> (opsiyonel) classifier head -> logits (n_classes)
+    """
+    def __init__(self, in_dim=1024, n_classes=2, embed_dim=512):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self._fc1      = nn.Sequential(nn.Linear(in_dim, embed_dim), nn.ReLU())
+        self.cls_token = nn.Parameter(torch.randn(1,1,embed_dim))
+        self.layer1    = TransLayer(embed_dim)
+        self.pos_layer = PPEG(embed_dim)
+        self.layer2    = TransLayer(embed_dim)
+        self.norm      = nn.LayerNorm(embed_dim)
+        self._fc2      = nn.Linear(embed_dim, n_classes)  # siniflandirma basligi
+
+    def forward(self, x, return_embedding=True):
+        h = self._fc1(x); B,N,_ = h.shape
+        h = torch.cat([self.cls_token.expand(B,-1,-1), h], dim=1)
+        h = self.layer1(h)
+
+        # Patch'leri kareye yakin grid'e yerleştir (PPEG icin gerekli)
+        H = W = int(math.ceil(math.sqrt(N)))
+        pad = H*W - N
+
+        # Grid tam dolmuyorsa sifirlarla doldur
+        if pad > 0:
+            h = torch.cat([h[:,0:1], h[:,1:], h.new_zeros(B,pad,self.embed_dim)], dim=1)
+
+        h = self.pos_layer(h, H, W)
+        h = self.layer2(h); h = self.norm(h)
+
+        # return_embedding=True  -> CLS token (slide embedding) doner  [B, 1, embed_dim]
+        # return_embedding=False -> sinif logitleri doner               [B, n_classes]
+        return h[:,0:1] if return_embedding else self._fc2(h[:,0])
+
+
+# --- YARDIMCI FONKSIYONLAR ----------------------------------------------------
+
+def load_checkpoint(model, ckpt_path, device):
+    """
+    Checkpoint yukler. Farkli kaydetme formatlarini (state_dict, model, vb.)
+    ve farkli key prefix'lerini (model., module., vb.) otomatik olarak ele alir.
+    """
+    # weights_only=False: eski PyTorch checkpointlari icin gerekli
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    sd = ckpt.get("state_dict") or ckpt.get("model_state_dict") or ckpt.get("model") or ckpt
+
+    # Farkli egitim framework'lerinin ekledigi prefix'leri temizle
+    cleaned = {}
+    for k, v in sd.items():
+        for p in ("model.", "module.", "network.", "mil_model."):
+            if k.startswith(p):
+                k = k[len(p):]
+                break
+        cleaned[k] = v
+
+    missing, unexpected = model.load_state_dict(cleaned, strict=False)
+
+    # Eksik key'ler varsa: checkpoint bu katmanlari icermiyor (farkli mimari olabilir)
+    if missing:
+        print(f"Eksik key ({len(missing)}): {missing[:3]}")
+    # Beklenmeyen key'ler varsa: checkpoint'ta fazladan katmanlar var (genellikle sorun olmaz)
+    if unexpected:
+        print(f"Beklenmeyen key ({len(unexpected)}): {unexpected[:3]}")
+
+    return model
+
+
+def load_h5_features(h5_path, device):
+    """
+    TRIDENT ciktisi .h5 dosyasindan patch feature'larini yukler.
+    Farkli key isimlerini (features, feats, embeddings, feat) otomatik dener.
+    Donen tensor: [1, N_patches, feature_dim]
+    """
+    with h5py.File(h5_path, "r") as f:
+        key = next((k for k in ["features", "feats", "embeddings", "feat"] if k in f), list(f.keys())[0])
+        feats = torch.from_numpy(f[key][:]).float().unsqueeze(0).to(device)
+
+    return feats, key
+
+
+# --- ANA FONKSIYON ------------------------------------------------------------
+
+def process_folder(args):
+    # GPU varsa CUDA, yoksa CPU kullan
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Cihaz: {device}")
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model = TransMIL(
+        in_dim=args.in_dim,       # patch encoder ciktisi boyutu (uni_v2: 1536, uni_v1: 1024)
+        n_classes=args.n_classes,
+        embed_dim=args.embed_dim  # TransMIL ic boyutu, genellikle 512
+    )
+
+    model = load_checkpoint(model, args.ckpt_path, device)
+    model.to(device).eval()  # eval(): dropout kapatir, BatchNorm istatistiklerini dondurur
+    print("✓ Checkpoint yuklendi")
+
+    # rglob: alt klasorleri de tarar (glob sadece ust klasore bakar)
+    h5_files = sorted(Path(args.h5_dir).rglob("*.h5"))
+
+    if len(h5_files) == 0:
+        raise FileNotFoundError(f"No .h5 files found in: {args.h5_dir}")
+
+    print(f"Bulunan h5 dosyasi: {len(h5_files)}")
+
+    failed = []
+
+    for i, h5_path in enumerate(h5_files):
+        print(f"\n[{i+1}/{len(h5_files)}] Isleniyor: {h5_path.name}")
+
+        try:
+            feats, key = load_h5_features(h5_path, device)
+            print(f"Patch shape: {feats.shape}  (key='{key}')")
+
+            with torch.no_grad():  # gradient hesaplamayı kapat -> bellek ve hiz kazanci
+                slide_emb = model(feats, return_embedding=True).cpu().numpy()
+
+            # Cikti: slide adiyla ayni isimde .npy dosyasi
+            output_path = output_dir / f"{h5_path.stem}.npy"
+            np.save(output_path, slide_emb)
+
+            print(f"✓ Slide embedding shape: {slide_emb.shape}")
+            print(f"✓ Kaydedildi -> {output_path}")
+
+        except Exception as e:
+            # Hatali slide'i atla, digerlerine devam et
+            print(f"✗ HATA: {h5_path.name} -> {e}")
+            failed.append(h5_path.name)
+            continue
+
+    # Ozet
+    print(f"\n{'='*50}")
+    print(f"Tamamlandi: {len(h5_files) - len(failed)}/{len(h5_files)} slide islendi")
+    if failed:
+        print(f"Basarisiz ({len(failed)}):")
+        for f in failed:
+            print(f"  - {f}")
+
+
+# --- ARG PARSE ----------------------------------------------------------------
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--h5_dir",     type=str, required=True,  help="TRIDENT .h5 cikti klasoru")
+    parser.add_argument("--ckpt_path",  type=str, required=True,  help="TransMIL checkpoint (.pt)")
+    parser.add_argument("--output_dir", type=str, required=True,  help="Slide embedding cikti klasoru")
+
+    parser.add_argument("--in_dim",    type=int, default=1024, help="Patch encoder boyutu (uni_v2: 1536, uni_v1: 1024)")
+    parser.add_argument("--n_classes", type=int, default=2,    help="Sinif sayisi")
+    parser.add_argument("--embed_dim", type=int, default=512,  help="TransMIL ic boyutu")
+
+    args = parser.parse_args()
+
+    process_folder(args)

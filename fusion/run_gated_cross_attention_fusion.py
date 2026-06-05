@@ -3,34 +3,52 @@
 # ============================================================
 #
 # Purpose:
-#   Train a gated cross-attention fusion model using WSI and clinical
-#   embeddings, then export new fused .npy embeddings.
+#   Train gated cross-attention fusion using a predefined split.
 #
 # Important:
-#   Attention fusion is trainable.
-#   Therefore, patients must be split into train/val/test BEFORE training.
+#   This script DOES NOT create train/val/test splits.
+#   It receives split files from a dedicated split directory.
+#
+# Required split files:
+#   split_dir/
+#       train_patients.csv
+#       val_patients.csv
+#       test_patients.csv
 #
 # Workflow:
-#   1. Read WSI .npy + clinical .npy + labels.csv
-#   2. Split patients into train / validation / test
-#   3. Train attention fusion model only on train set
-#   4. Use validation set only to choose the best model
-#   5. Load best model
-#   6. Export fused .npy embeddings for train / val / test
+#   1. Load fixed train/val/test CSV files
+#   2. Train gated cross-attention model on train patients only
+#   3. Select best model using validation AUC
+#   4. Export fused .npy embeddings for train/val/test
 #
 # Output:
 #   output_dir/
 #       best_fusion_model.pt
-#       train_patients.csv
-#       val_patients.csv
-#       test_patients.csv
 #       fused_train/
-#           patient001.npy
 #       fused_val/
-#           patient101.npy
 #       fused_test/
-#           patient201.npy
 #
+# Example:
+#   python train_and_export_gated_cross_attention.py ^
+#     --wsi_dir "D:\embeddings\wsi" ^
+#     --clinical_dir "D:\embeddings\clinical" ^
+#     --split_dir "D:\splits\wsi_clinical_split" ^
+#     --output_dir "D:\embeddings\fused_attention"
+#
+# Arguments:
+#   --wsi_dir        Folder containing WSI .npy embeddings.
+#   --clinical_dir   Folder containing clinical .npy embeddings.
+#   --split_dir      Folder containing train_patients.csv, val_patients.csv, test_patients.csv.
+#   --output_dir     Folder where fused embeddings and best model will be saved.
+#   --wsi_dim        WSI embedding dimension. Default: 512
+#   --clinical_dim   Clinical embedding dimension. Default: 64
+#   --fused_dim      Output fused embedding dimension. Default: 256
+#   --num_tokens     Number of tokens created from each modality embedding. Default: 8
+#   --num_heads      Number of attention heads. Default: 4
+#   --epochs         Training epochs. Default: 50
+#   --batch_size     Batch size. Default: 16
+#   --lr             Learning rate. Default: 1e-4
+#   --seed           Random seed. Default: 42
 # ============================================================
 
 import argparse
@@ -44,7 +62,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
 
 
@@ -81,12 +98,19 @@ class EmbeddingDataset(Dataset):
         wsi_path = self.wsi_dir / f"{patient_id}.npy"
         clinical_path = self.clinical_dir / f"{patient_id}.npy"
 
+        if not wsi_path.exists():
+            raise FileNotFoundError(f"Missing WSI embedding: {wsi_path}")
+
+        if not clinical_path.exists():
+            raise FileNotFoundError(f"Missing clinical embedding: {clinical_path}")
+
         wsi = np.load(wsi_path).astype(np.float32)
         clinical = np.load(clinical_path).astype(np.float32)
 
-        # Safety checks.
         if wsi.shape != (self.wsi_dim,):
-            raise ValueError(f"{patient_id}: WSI shape {wsi.shape}, expected ({self.wsi_dim},)")
+            raise ValueError(
+                f"{patient_id}: WSI shape {wsi.shape}, expected ({self.wsi_dim},)"
+            )
 
         if clinical.shape != (self.clinical_dim,):
             raise ValueError(
@@ -120,18 +144,14 @@ class GatedCrossAttentionFusion(nn.Module):
         self.fused_dim = fused_dim
         self.num_tokens = num_tokens
 
-        # Converts one WSI embedding into token sequence.
-        # [B, 512] -> [B, num_tokens, fused_dim]
+        # Convert each modality vector into token sequences.
         self.wsi_tokenizer = nn.Linear(wsi_dim, num_tokens * fused_dim)
-
-        # Converts one clinical embedding into token sequence.
-        # [B, 64] -> [B, num_tokens, fused_dim]
         self.clinical_tokenizer = nn.Linear(clinical_dim, num_tokens * fused_dim)
 
         self.wsi_norm = nn.LayerNorm(fused_dim)
         self.clinical_norm = nn.LayerNorm(fused_dim)
 
-        # WSI attends to clinical information.
+        # WSI queries clinical features.
         self.wsi_to_clinical = nn.MultiheadAttention(
             embed_dim=fused_dim,
             num_heads=num_heads,
@@ -139,7 +159,7 @@ class GatedCrossAttentionFusion(nn.Module):
             batch_first=True,
         )
 
-        # Clinical attends to WSI information.
+        # Clinical queries WSI features.
         self.clinical_to_wsi = nn.MultiheadAttention(
             embed_dim=fused_dim,
             num_heads=num_heads,
@@ -147,7 +167,7 @@ class GatedCrossAttentionFusion(nn.Module):
             batch_first=True,
         )
 
-        # Gate decides how much WSI context and clinical context contribute.
+        # Gate controls WSI/clinical contribution.
         self.gate = nn.Sequential(
             nn.Linear(fused_dim * 2, fused_dim),
             nn.ReLU(),
@@ -158,7 +178,7 @@ class GatedCrossAttentionFusion(nn.Module):
         self.output_norm = nn.LayerNorm(fused_dim)
 
         # Temporary classifier.
-        # This is needed only during training so attention learns meaningful weights.
+        # It is used only to train the fusion encoder.
         self.classifier = nn.Sequential(
             nn.Linear(fused_dim, 128),
             nn.ReLU(),
@@ -169,7 +189,6 @@ class GatedCrossAttentionFusion(nn.Module):
     def encode(self, wsi, clinical):
         batch_size = wsi.size(0)
 
-        # Tokenize both modalities.
         wsi_tokens = self.wsi_tokenizer(wsi)
         clinical_tokens = self.clinical_tokenizer(clinical)
 
@@ -179,7 +198,7 @@ class GatedCrossAttentionFusion(nn.Module):
         wsi_tokens = self.wsi_norm(wsi_tokens)
         clinical_tokens = self.clinical_norm(clinical_tokens)
 
-        # Cross-attention in both directions.
+        # Bidirectional cross-attention.
         wsi_attended, _ = self.wsi_to_clinical(
             query=wsi_tokens,
             key=clinical_tokens,
@@ -192,14 +211,14 @@ class GatedCrossAttentionFusion(nn.Module):
             value=wsi_tokens,
         )
 
-        # Residual connection + average pooling over tokens.
+        # Residual connection + token pooling.
         wsi_context = (wsi_tokens + wsi_attended).mean(dim=1)
         clinical_context = (clinical_tokens + clinical_attended).mean(dim=1)
 
         # Gated fusion.
         gate = self.gate(torch.cat([wsi_context, clinical_context], dim=1))
-
         fused = gate * wsi_context + (1.0 - gate) * clinical_context
+
         fused = self.output_norm(fused)
 
         return fused
@@ -263,7 +282,11 @@ def evaluate(model, loader, criterion, device):
 
     preds = (all_probs >= 0.5).astype(int)
 
-    auc = roc_auc_score(all_labels, all_probs)
+    if len(np.unique(all_labels)) > 1:
+        auc = roc_auc_score(all_labels, all_probs)
+    else:
+        auc = np.nan
+
     acc = accuracy_score(all_labels, preds)
     f1 = f1_score(all_labels, preds)
 
@@ -286,13 +309,13 @@ def export_fused_embeddings(model, dataset, output_dir, device):
 
     with torch.no_grad():
         for patient_ids, wsi, clinical, _ in loader:
-            patient_id = patient_ids[0]
+            patient_id = str(patient_ids[0])
 
             wsi = wsi.to(device)
             clinical = clinical.to(device)
 
-            # Only the encoder part is used here.
-            # The temporary classifier is ignored.
+            # Only encoder part is used here.
+            # The classifier is ignored.
             fused = model.encode(wsi, clinical)
 
             fused_np = fused.squeeze(0).cpu().numpy().astype(np.float32)
@@ -312,7 +335,7 @@ def main():
 
     parser.add_argument("--wsi_dir", required=True, type=str)
     parser.add_argument("--clinical_dir", required=True, type=str)
-    parser.add_argument("--labels_csv", required=True, type=str)
+    parser.add_argument("--split_dir", required=True, type=str)
     parser.add_argument("--output_dir", required=True, type=str)
 
     parser.add_argument("--wsi_dim", default=512, type=int)
@@ -325,75 +348,42 @@ def main():
     parser.add_argument("--epochs", default=50, type=int)
     parser.add_argument("--batch_size", default=16, type=int)
     parser.add_argument("--lr", default=1e-4, type=float)
-
-    parser.add_argument("--val_size", default=0.15, type=float)
-    parser.add_argument("--test_size", default=0.15, type=float)
     parser.add_argument("--seed", default=42, type=int)
 
     args = parser.parse_args()
 
     set_seed(args.seed)
 
-    wsi_dir = Path(args.wsi_dir)
-    clinical_dir = Path(args.clinical_dir)
+    split_dir = Path(args.split_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # --------------------------------------------------------
-    # Read labels and keep only patients with both embeddings.
-    # --------------------------------------------------------
+    train_csv = split_dir / "train_patients.csv"
+    val_csv = split_dir / "val_patients.csv"
+    test_csv = split_dir / "test_patients.csv"
 
-    df = pd.read_csv(args.labels_csv)
+    if not train_csv.exists():
+        raise FileNotFoundError(f"Missing: {train_csv}")
 
-    matched_rows = []
+    if not val_csv.exists():
+        raise FileNotFoundError(f"Missing: {val_csv}")
 
-    for _, row in df.iterrows():
-        patient_id = str(row["patient_id"])
-        label = int(row["label"])
+    if not test_csv.exists():
+        raise FileNotFoundError(f"Missing: {test_csv}")
 
-        wsi_path = wsi_dir / f"{patient_id}.npy"
-        clinical_path = clinical_dir / f"{patient_id}.npy"
+    train_df = pd.read_csv(train_csv)
+    val_df = pd.read_csv(val_csv)
+    test_df = pd.read_csv(test_csv)
 
-        if wsi_path.exists() and clinical_path.exists():
-            matched_rows.append({"patient_id": patient_id, "label": label})
-
-    df = pd.DataFrame(matched_rows)
-
-    print("Matched patients:", len(df))
-    print(df["label"].value_counts())
-
-    # --------------------------------------------------------
-    # Split FIRST.
-    # This prevents data leakage.
-    # --------------------------------------------------------
-
-    train_val_df, test_df = train_test_split(
-        df,
-        test_size=args.test_size,
-        random_state=args.seed,
-        stratify=df["label"],
-    )
-
-    relative_val_size = args.val_size / (1.0 - args.test_size)
-
-    train_df, val_df = train_test_split(
-        train_val_df,
-        test_size=relative_val_size,
-        random_state=args.seed,
-        stratify=train_val_df["label"],
-    )
-
-    train_df.to_csv(output_dir / "train_patients.csv", index=False)
-    val_df.to_csv(output_dir / "val_patients.csv", index=False)
-    test_df.to_csv(output_dir / "test_patients.csv", index=False)
-
+    print("Using predefined split:")
     print("Train:", len(train_df))
     print("Val:", len(val_df))
     print("Test:", len(test_df))
 
-    # --------------------------------------------------------
-    # Create datasets and loaders.
-    # --------------------------------------------------------
+    # Save copies of the split files inside this experiment folder.
+    train_df.to_csv(output_dir / "train_patients.csv", index=False)
+    val_df.to_csv(output_dir / "val_patients.csv", index=False)
+    test_df.to_csv(output_dir / "test_patients.csv", index=False)
 
     train_dataset = EmbeddingDataset(
         train_df,
@@ -433,12 +423,6 @@ def main():
         num_workers=0,
     )
 
-    # --------------------------------------------------------
-    # Train attention fusion model.
-    # Only train set updates the weights.
-    # Validation only selects the best epoch.
-    # --------------------------------------------------------
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
 
@@ -450,6 +434,7 @@ def main():
         num_heads=args.num_heads,
     ).to(device)
 
+    # Class imbalance handling using only training labels.
     pos_count = train_df["label"].sum()
     neg_count = len(train_df) - pos_count
     pos_weight = torch.tensor([neg_count / max(pos_count, 1)], device=device)
@@ -459,6 +444,12 @@ def main():
 
     best_auc = -1.0
     best_path = output_dir / "best_fusion_model.pt"
+
+    # --------------------------------------------------------
+    # Train on train split.
+    # Validate on validation split.
+    # Test split is not touched during training.
+    # --------------------------------------------------------
 
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(
@@ -485,18 +476,19 @@ def main():
             f"Val F1: {val_f1:.4f}"
         )
 
-        # Save the model that works best on validation set.
-        if val_auc > best_auc:
+        if not np.isnan(val_auc) and val_auc > best_auc:
             best_auc = val_auc
             torch.save(model.state_dict(), best_path)
             print(f"Saved best model: {best_path}")
 
     print("Best validation AUC:", best_auc)
 
+    if not best_path.exists():
+        raise RuntimeError("No best model was saved. Check validation labels/AUC.")
+
     # --------------------------------------------------------
-    # Load best fusion model.
-    # Then export fused embeddings for train / val / test.
-    # Labels are not used during export.
+    # Export fused embeddings after training.
+    # The same trained fusion encoder is used for all splits.
     # --------------------------------------------------------
 
     model.load_state_dict(torch.load(best_path, map_location=device))

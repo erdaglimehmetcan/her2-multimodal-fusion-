@@ -1,8 +1,17 @@
-<img alt="tmp_df298bbe-6b68-410b-9e1d-77c3b0e066a1" src="https://github.com/user-attachments/assets/c8cd1dd6-5211-4c0f-ba87-bd4206d8d663" />
+
 
 
 ### HER2 Classification via Multimodal Fusion of WSI and Clinical Data
 <br clear="right"/>
+
+<p align="center">
+  <img 
+    src="https://github.com/user-attachments/assets/c8cd1dd6-5211-4c0f-ba87-bd4206d8d663" 
+    alt="HER2 Fusion Logo" 
+    width="350"
+    align=left
+  />
+</p>
 
 A modular deep learning pipeline for HER2 binary classification using multimodal fusion of Whole Slide Images (WSI) and clinical tabular data. Four fusion strategies are compared — concatenation, gated attention, cross-attention, and gated cross-attention — followed by a broad classifier sweep using LazyPredict.
 
@@ -11,7 +20,7 @@ A modular deep learning pipeline for HER2 binary classification using multimodal
 ---
 
 ## Overview
-
+<img src="https://github.com/user-attachments/assets/8a6db418-fcd8-49c6-af68-b6a8263ea213" align="right" width="250"/>
 This repository contains the full pipeline for a thesis study on multimodal cancer classification. The pipeline is divided into two stages:
 
 **Stage 1 — Modality-Specific Embedding Extraction**

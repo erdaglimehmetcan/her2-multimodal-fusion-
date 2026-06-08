@@ -1,4 +1,4 @@
-<img src="https://github.com/user-attachments/assets/8a6db418-fcd8-49c6-af68-b6a8263ea213" align="left" width="150"/>
+<img src="https://github.com/user-attachments/assets/8a6db418-fcd8-49c6-af68-b6a8263ea213" align="left" width="180"/>
 
 
 ### HER2 Classification via Multimodal Fusion of WSI and Clinical Data

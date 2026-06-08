@@ -1,185 +1,33 @@
 # ============================================================
 # Clinical Embedding Extraction
-# run_clinical_embedding.py
-# ============================================================
 #
-# PURPOSE
-# -------
-# Reads patient-level clinical data from an Excel file,
-# performs preprocessing, and generates a fixed-length
-# embedding vector for each patient.
+# Purpose:
+#   Reads clinical Excel data, preprocesses variables, and saves
+#   one clinical embedding .npy file per patient.
 #
-# The output of this script is one .npy file per patient:
+# Input:
+#   Excel file with one row per patient.
+#   Required column: patient_id
+#   Do not include HER2 label as a feature.
 #
-#   patient001.npy
-#   patient002.npy
-#   patient003.npy
+# Output:
+#   output_dir/
+#       patient001.npy  # shape: (embedding_dim,)
 #
-# Each .npy file contains a clinical embedding that can later
-# be fused with WSI embeddings using:
+# Example:
+#   python run_clinical_embedding.py ^
+#     --excel_path "D:\data\clinical.xlsx" ^
+#     --output_dir "D:\CLINICAL_EMBEDDINGS" ^
+#     --patient_id_column "patient_id" ^
+#     --embedding_dim 64
 #
-#   - Concatenation Fusion
-#   - Gated Attention Fusion
-#   - Cross-Attention Fusion
-#   - Gated Cross-Attention Fusion
-#
-#
-# PIPELINE POSITION
-# -----------------
-#
-# Clinical Excel
-#       ↓
-# Clinical Embedding Script
-#       ↓
-# Clinical .npy Embeddings
-#       ↓
-# Fusion Methods
-#       ↓
-# Fused Embeddings
-#       ↓
-# Classifiers
-#       ↓
-# HER2 Prediction
-#
-#
-# INPUT REQUIREMENTS
-# ------------------
-#
-# Example Excel:
-#
-# patient_id | age | er_status | pr_status | tumor_grade
-# ------------------------------------------------------
-# TCGA-01    | 55  | Positive  | Negative  | 2
-# TCGA-02    | 48  | Positive  | Positive  | 3
-# TCGA-03    | 67  | Negative  | Negative  | 2
-#
-# Notes:
-#
-# - One row must represent one patient.
-# - The patient ID column must be unique.
-# - Do NOT include HER2 labels in this file.
-# - Labels should be stored separately.
-#
-#
-# PREPROCESSING
-# -------------
-#
-# This script automatically:
-#
-# 1. Encodes categorical variables
-#
-#       Positive -> 1
-#       Negative -> 0
-#
-# 2. Fills missing numeric values using median imputation
-#
-# 3. Standardizes features using StandardScaler
-#
-#       mean = 0
-#       std  = 1
-#
-# 4. Projects clinical features into a lower-dimensional
-#    embedding space using an untrained deep MLP.
-#
-#
-# OUTPUT
-# ------
-#
-# Example output directory:
-#
-# CLINICAL_EMBEDDINGS/
-#
-# ├── TCGA-01.npy
-# ├── TCGA-02.npy
-# ├── TCGA-03.npy
-# └── ...
-#
-#
-# EXAMPLE OUTPUT SHAPE
-# --------------------
-#
-# If:
-#
-#   --embedding_dim 64
-#
-# then:
-#
-#   TCGA-01.npy
-#
-# contains:
-#
-#   shape = (64,)
-#
-#
-# EXAMPLE USAGE
-# -------------
-#
-# Basic:
-#
-# python run_clinical_embedding.py ^
-#   --excel_path "D:\data\clinical.xlsx" ^
-#   --output_dir "D:\CLINICAL_EMBEDDINGS"
-#
-#
-# Custom Patient ID Column:
-#
-# python run_clinical_embedding.py ^
-#   --excel_path "D:\data\clinical.xlsx" ^
-#   --output_dir "D:\CLINICAL_EMBEDDINGS" ^
-#   --patient_id_column "tcga_patient_id"
-#
-#
-# Custom Embedding Dimension:
-#
-# python run_clinical_embedding.py ^
-#   --excel_path "D:\data\clinical.xlsx" ^
-#   --output_dir "D:\CLINICAL_EMBEDDINGS" ^
-#   --embedding_dim 128
-#
-#
-# ARGUMENTS
-# ---------
-#
-# --excel_path
-#     Path to the clinical Excel file (.xlsx).
-#
-# --output_dir
-#     Directory where clinical embeddings will be saved.
-#
-# --patient_id_column
-#     Name of the patient ID column in the Excel file.
-#
-#     Default:
-#         patient_id
-#
-# --embedding_dim
-#     Output embedding dimension.
-#
-#     Default:
-#         64
-#
-#
-# NOTES
-# -----
-#
-# This script does NOT:
-#
-# - Train a classifier
-# - Predict HER2 status
-# - Use HER2 labels
-#
-# It only converts clinical variables into embedding vectors.
-#
-# Labels should be stored separately and used later during:
-#
-#   - Dataset splitting
-#   - Fusion training
-#   - Classifier training
-#   - Model evaluation
+# Arguments:
+#   --excel_path         Clinical Excel file path.
+#   --output_dir         Folder for saved .npy embeddings.
+#   --patient_id_column  Patient ID column name. Default: patient_id
+#   --embedding_dim      Output embedding dimension. Default: 64
 #
 # ============================================================
-
-
 import os
 import argparse
 

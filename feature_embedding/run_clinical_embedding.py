@@ -1,17 +1,184 @@
 # ============================================================
+# Clinical Embedding Extraction
 # run_clinical_embedding.py
-#
-# Excel dosyasindan klinik veriyi okur, on-isleme yapar,
-# eğitimsiz derin MLP ile her hasta icin 64-dim embedding
-# cikarir ve .npy olarak kaydeder.
-#
-# Kullanim:
-#   python run_clinical_embedding.py \
-#     --excel_path "D:/data/clinical.xlsx" \
-#     --output_dir "D:/CLINICAL_EMBEDDINGS" \
-#     --patient_id_column "patient_id" \
-#     --embedding_dim 64
 # ============================================================
+#
+# PURPOSE
+# -------
+# Reads patient-level clinical data from an Excel file,
+# performs preprocessing, and generates a fixed-length
+# embedding vector for each patient.
+#
+# The output of this script is one .npy file per patient:
+#
+#   patient001.npy
+#   patient002.npy
+#   patient003.npy
+#
+# Each .npy file contains a clinical embedding that can later
+# be fused with WSI embeddings using:
+#
+#   - Concatenation Fusion
+#   - Gated Attention Fusion
+#   - Cross-Attention Fusion
+#   - Gated Cross-Attention Fusion
+#
+#
+# PIPELINE POSITION
+# -----------------
+#
+# Clinical Excel
+#       ↓
+# Clinical Embedding Script
+#       ↓
+# Clinical .npy Embeddings
+#       ↓
+# Fusion Methods
+#       ↓
+# Fused Embeddings
+#       ↓
+# Classifiers
+#       ↓
+# HER2 Prediction
+#
+#
+# INPUT REQUIREMENTS
+# ------------------
+#
+# Example Excel:
+#
+# patient_id | age | er_status | pr_status | tumor_grade
+# ------------------------------------------------------
+# TCGA-01    | 55  | Positive  | Negative  | 2
+# TCGA-02    | 48  | Positive  | Positive  | 3
+# TCGA-03    | 67  | Negative  | Negative  | 2
+#
+# Notes:
+#
+# - One row must represent one patient.
+# - The patient ID column must be unique.
+# - Do NOT include HER2 labels in this file.
+# - Labels should be stored separately.
+#
+#
+# PREPROCESSING
+# -------------
+#
+# This script automatically:
+#
+# 1. Encodes categorical variables
+#
+#       Positive -> 1
+#       Negative -> 0
+#
+# 2. Fills missing numeric values using median imputation
+#
+# 3. Standardizes features using StandardScaler
+#
+#       mean = 0
+#       std  = 1
+#
+# 4. Projects clinical features into a lower-dimensional
+#    embedding space using an untrained deep MLP.
+#
+#
+# OUTPUT
+# ------
+#
+# Example output directory:
+#
+# CLINICAL_EMBEDDINGS/
+#
+# ├── TCGA-01.npy
+# ├── TCGA-02.npy
+# ├── TCGA-03.npy
+# └── ...
+#
+#
+# EXAMPLE OUTPUT SHAPE
+# --------------------
+#
+# If:
+#
+#   --embedding_dim 64
+#
+# then:
+#
+#   TCGA-01.npy
+#
+# contains:
+#
+#   shape = (64,)
+#
+#
+# EXAMPLE USAGE
+# -------------
+#
+# Basic:
+#
+# python run_clinical_embedding.py ^
+#   --excel_path "D:\data\clinical.xlsx" ^
+#   --output_dir "D:\CLINICAL_EMBEDDINGS"
+#
+#
+# Custom Patient ID Column:
+#
+# python run_clinical_embedding.py ^
+#   --excel_path "D:\data\clinical.xlsx" ^
+#   --output_dir "D:\CLINICAL_EMBEDDINGS" ^
+#   --patient_id_column "tcga_patient_id"
+#
+#
+# Custom Embedding Dimension:
+#
+# python run_clinical_embedding.py ^
+#   --excel_path "D:\data\clinical.xlsx" ^
+#   --output_dir "D:\CLINICAL_EMBEDDINGS" ^
+#   --embedding_dim 128
+#
+#
+# ARGUMENTS
+# ---------
+#
+# --excel_path
+#     Path to the clinical Excel file (.xlsx).
+#
+# --output_dir
+#     Directory where clinical embeddings will be saved.
+#
+# --patient_id_column
+#     Name of the patient ID column in the Excel file.
+#
+#     Default:
+#         patient_id
+#
+# --embedding_dim
+#     Output embedding dimension.
+#
+#     Default:
+#         64
+#
+#
+# NOTES
+# -----
+#
+# This script does NOT:
+#
+# - Train a classifier
+# - Predict HER2 status
+# - Use HER2 labels
+#
+# It only converts clinical variables into embedding vectors.
+#
+# Labels should be stored separately and used later during:
+#
+#   - Dataset splitting
+#   - Fusion training
+#   - Classifier training
+#   - Model evaluation
+#
+# ============================================================
+
 
 import os
 import argparse
@@ -32,15 +199,15 @@ import torch.nn as nn
 
 class ClinicalMLP(nn.Module):
     """
-    Egitimsiz derin MLP projeksiyon agi.
-    Amac: yuksek boyutlu klinik veriyi dusuk boyutlu (embedding_dim)
-    bir uzaya non-linear olarak projekte etmek.
+    Untrained deep MLP projection network.
+    Purpose: project high-dimensional clinical data into a lower-dimensional
+    non-linear embedding space.
 
-    5 katman kullanilmasinin nedeni: rastgele agirliklarla bile
-    derin aglar daha zengin non-linear temsil olusturur.
+    Reason for using 5 layers: even with random weights, deeper networks can
+    produce richer non-linear representations.
 
-    NOT: Her calistirmada ayni sonucu almak icin main() icinde
-    torch.manual_seed() ve np.random.seed() set edilmistir.
+    NOTE: To obtain the same result in every run, torch.manual_seed() and
+    np.random.seed() are set inside main().
     """
     def __init__(self, input_dim, embedding_dim=64):
         super().__init__()
@@ -59,8 +226,8 @@ class ClinicalMLP(nn.Module):
             nn.Linear(128, 128),
             nn.ReLU(),
 
-            # Son katman: embedding_dim boyutunda cikti
-            # Bu katmanin aktivasyon sonrasi degerleri embedding olarak kullanilir
+            # Final layer: output with embedding_dim dimensions.
+            # Values after this activation are used as embeddings.
             nn.Linear(128, embedding_dim),
             nn.ReLU()
         )
@@ -75,7 +242,7 @@ class ClinicalMLP(nn.Module):
 
 def main(args):
 
-    # Reproducibility: ayni seed ile her calistirmada ayni embedding'ler cikar
+    # Reproducibility: with the same seed, identical embeddings are produced.
     torch.manual_seed(42)
     np.random.seed(42)
 
@@ -102,35 +269,36 @@ def main(args):
             continue
 
         if df[column].dtype == "object":
-            # Kategorik sutunlari sayisala donustur (ornek: "Erkek"/"Kadin" -> 0/1)
-            # NOT: Bu encoder kaydedilmiyor. Ayni encoding'i tekrar kullanmak
-            # isterseniz encoder'i pickle ile kaydetmeniz gerekir.
+            # Convert categorical columns to numeric values
+            # Example: "Male"/"Female" -> 0/1
+            # NOTE: This encoder is not saved. If the same encoding is needed
+            # later, the encoder should be saved with pickle.
             encoder = LabelEncoder()
             df[column] = encoder.fit_transform(df[column].astype(str))
 
-    # Eksik degerleri median ile doldur.
-    # Sifir ile doldurmak (fillna(0)) yas, tumor boyutu gibi sutunlarda
-    # istatistiksel olarak yanlis olabilir; median daha gercekci bir deger koyar.
+    # Fill missing values with the median.
+    # Using zero filling may be statistically inappropriate for variables
+    # such as age or tumor size; median is a more realistic replacement.
     numeric_cols = df.select_dtypes(include=np.number).columns
     df[numeric_cols] = df[numeric_cols].fillna(df[numeric_cols].median())
 
-    # Kategorik donusum sonrasi kalan bos degerler icin fallback
+    # Fallback for any remaining missing values after categorical conversion.
     df = df.fillna(0)
 
     # ========================================================
     # FEATURES
     # ========================================================
 
-    # Patient ID sutununu feature'lardan cikar
+    # Remove patient ID column from features.
     features = df.drop(columns=[args.patient_id_column]).values
 
     # ========================================================
     # NORMALIZATION
     # ========================================================
 
-    # StandardScaler: her sutunu mean=0, std=1 yaparak olcekler.
-    # MLP'nin her ozelligi esit agirlikla isliyebilmesi icin gerekli;
-    # olceklenmemis veride buyuk degerli sutunlar modele hakim olur.
+    # StandardScaler scales each column to mean=0 and std=1.
+    # This is necessary so the MLP can process all features on a similar scale;
+    # otherwise, large-scale variables may dominate the model.
     scaler = StandardScaler()
     features = scaler.fit_transform(features).astype(np.float32)
 
@@ -146,16 +314,17 @@ def main(args):
         embedding_dim=args.embedding_dim
     )
 
-    model.eval()  # dropout/batchnorm katmanlari yoksa fark etmez ama standart pratik
+    model.eval()  # Standard practice, although there is no dropout/batchnorm here.
 
     # ========================================================
     # GENERATE EMBEDDINGS
     # ========================================================
 
-    # torch.from_numpy: numpy array'i kopyalamadan tensor'a cevirir (torch.tensor'dan daha verimli)
+    # torch.from_numpy converts the numpy array to tensor without copying
+    # when possible, making it more efficient than torch.tensor().
     x_tensor = torch.from_numpy(features)
 
-    with torch.no_grad():  # gradient hesaplamaya gerek yok, bellek tasarrufu
+    with torch.no_grad():  # No gradients are needed; saves memory.
         embeddings = model(x_tensor)
 
     embeddings = embeddings.numpy()  # [N_patients, embedding_dim]
@@ -191,29 +360,33 @@ if __name__ == "__main__":
         "--excel_path",
         type=str,
         required=True,
-        help="Klinik veri Excel dosyasi (.xlsx)"
+        help="Clinical data Excel file (.xlsx)"
     )
 
     parser.add_argument(
         "--output_dir",
         type=str,
         required=True,
-        help="Embedding .npy dosyalarinin kaydedilecegi klasor"
+        help="Directory where embedding .npy files will be saved"
     )
 
     parser.add_argument(
         "--patient_id_column",
         type=str,
         default="patient_id",
-        help="Excel'deki hasta ID sutununun adi"
+        help="Name of the patient ID column in the Excel file"
     )
 
     parser.add_argument(
         "--embedding_dim",
         type=int,
         default=64,
-        help="Cikti embedding boyutu (varsayilan: 64)"
+        help="Output embedding dimension (default: 64)"
     )
+
+    args = parser.parse_args()
+
+    main(args)
 
     args = parser.parse_args()
 

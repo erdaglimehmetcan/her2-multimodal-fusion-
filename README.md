@@ -1,26 +1,25 @@
 
 
 
-### HER2 Classification via Multimodal Fusion of WSI and Clinical Data
+# HER2 Classification via Multimodal Fusion of WSI and Clinical Data
 <br clear="right"/>
 
 <p align="center">
   <img 
-    src="https://github.com/user-attachments/assets/c8cd1dd6-5211-4c0f-ba87-bd4206d8d663" 
-    alt="HER2 Fusion Logo" 
-    width="350"
+    src="https://github.com/user-attachments/assets/b00126fd-a8e7-4b2d-803e-6765c50b7d13" 
+    alt="logo0" 
+    width="250"
     align=left
   />
 </p>
 
-A modular deep learning pipeline for HER2 binary classification using multimodal fusion of Whole Slide Images (WSI) and clinical tabular data. Four fusion strategies are compared — concatenation, gated attention, cross-attention, and gated cross-attention — followed by a broad classifier sweep using LazyPredict.
 
-<img width="1536" height="1024" alt="pipeline_abstract_wsi_cli" src="https://github.com/user-attachments/assets/a7435503-df37-4538-abbb-a7a200493559" />
+A modular deep learning pipeline for HER2 binary classification using multimodal fusion of Whole Slide Images (WSI) and clinical tabular data. Four fusion strategies are compared — concatenation, gated attention, cross-attention, and gated cross-attention — followed by a broad classifier sweep using LazyPredict.
 
 ---
 
 ## Overview
-<img src="https://github.com/user-attachments/assets/8a6db418-fcd8-49c6-af68-b6a8263ea213" align="right" width="250"/>
+
 This repository contains the full pipeline for a thesis study on multimodal cancer classification. The pipeline is divided into two stages:
 
 **Stage 1 — Modality-Specific Embedding Extraction**
@@ -30,6 +29,8 @@ Each data modality is independently encoded into a fixed-size embedding vector a
 WSI and clinical embeddings are fused using one of four attention strategies. The resulting fused embeddings are evaluated across multiple classifiers via LazyPredict.
 
 ---
+
+<img width="1536" height="1024" alt="pipeline_abstract_wsi_cli" src="https://github.com/user-attachments/assets/a7435503-df37-4538-abbb-a7a200493559" />
 
 ## Pipeline Architecture
 

@@ -17,6 +17,11 @@
 A modular deep learning pipeline for HER2 binary classification using multimodal fusion of Whole Slide Images (WSI) and clinical tabular data. Four fusion strategies are compared — concatenation, gated attention, cross-attention, and gated cross-attention — followed by a broad classifier sweep using LazyPredict.
 
 ---
+<br>
+<br>
+<br>
+
+
 
 ## Overview
 
